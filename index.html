@@ -68,6 +68,7 @@
   button:disabled { opacity: 0.5; cursor: default; }
   .seg {
     display: inline-flex;
+    flex-wrap: wrap;
     border: 1px solid #43454b;
     border-radius: 6px;
     overflow: hidden;
@@ -93,6 +94,8 @@
     white-space: pre-wrap;
     word-wrap: break-word;
     overflow-wrap: anywhere;
+    word-break: break-all;
+    overflow-x: hidden;
     resize: vertical;
   }
   .count { font-size: 0.85em; color: #9aa0aa; margin-bottom: 6px; }
@@ -118,9 +121,9 @@
 <div class="section">
 
   <div class="row">
-  <label for="fileInput">Audio/Video file</label>
-  <input type="file" id="fileInput">
-</div>
+    <label for="fileInput">Audio/Video file</label>
+    <input type="file" id="fileInput" accept="audio/*,video/*">
+  </div>
 
   <div class="row">
     <label for="sampleRateNumber">Sample rate (Hz)</label>
@@ -133,7 +136,11 @@
     <div class="seg" id="modeSeg">
       <button type="button" data-mode="raw" class="active">Bytebeat (raw 0–255)</button>
       <button type="button" data-mode="letters">Letters &amp; digits only</button>
+      <button type="button" data-mode="symbols">Letters, digits &amp; symbols</button>
     </div>
+  </div>
+  <div class="row">
+    <span class="note">"Symbols" mode adds readable punctuation (/ ~ &lt; &gt; ! @ # $ % ^ &amp; * ( ) - + = etc.) for much finer resolution than letters-only, while still keeping 1 character = 1 sample. It excludes only <code>'</code> and <code>\</code>, since those cannot appear unescaped in a single-quoted JS string without changing the character count.</span>
   </div>
 
   <div class="row">
@@ -155,6 +162,7 @@
   <div class="btnrow">
     <button id="convertBtn">Convert</button>
     <button id="playBtn">▶ Play bytebeat preview</button>
+    <button id="stopBtn" disabled>■ Stop preview</button>
     <button id="downloadWavBtn">Download as .wav</button>
   </div>
 
@@ -194,6 +202,7 @@
   const bassDbInput = document.getElementById('bassDbInput');
   const convertBtn = document.getElementById('convertBtn');
   const playBtn = document.getElementById('playBtn');
+  const stopBtn = document.getElementById('stopBtn');
   const downloadWavBtn = document.getElementById('downloadWavBtn');
   const statusEl = document.getElementById('status');
   const formulaOutput = document.getElementById('formulaOutput');
@@ -204,6 +213,8 @@
   const copyFullBtn = document.getElementById('copyFullBtn');
 
   let currentMode = 'raw';
+  let previewCtx = null;
+  let previewSource = null;
 
   function setStatus(msg){ statusEl.textContent = msg; }
 
@@ -367,16 +378,46 @@
     }
     return arr.join('');
   }
+
   const CHARSET62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-  function toLettersDigitsString(bytes){
+
+  // Readable symbol charset: all printable ASCII 33-126 except ' (39) and \ (92).
+  // Space (32) is excluded too, since leading/trailing/embedded spaces are prone
+  // to being trimmed or collapsed by some tools, which would silently corrupt data.
+  function buildSafeSymbolCharset(){
+    let chars = [];
+    for (let code = 33; code <= 126; code++){
+      if (code === 39 || code === 92) continue; // ' and \
+      chars.push(String.fromCharCode(code));
+    }
+    return chars.join('');
+  }
+  const CHARSET_SYMBOLS = buildSafeSymbolCharset();
+
+  function toQuantizedString(bytes, charset){
+    const n = charset.length;
     const arr = new Array(bytes.length);
     for (let i = 0; i < bytes.length; i++){
-      let level = Math.floor(bytes[i] * 62 / 256);
-      if (level > 61) level = 61;
+      let level = Math.floor(bytes[i] * n / 256);
+      if (level >= n) level = n - 1;
       if (level < 0) level = 0;
-      arr[i] = CHARSET62[level];
+      arr[i] = charset[level];
     }
     return arr.join('');
+  }
+
+  function encodeForMode(bytes, mode){
+    if (mode === 'raw') return toRawSafeString(bytes);
+    if (mode === 'letters') return toQuantizedString(bytes, CHARSET62);
+    if (mode === 'symbols') return toQuantizedString(bytes, CHARSET_SYMBOLS);
+    return toRawSafeString(bytes);
+  }
+
+  function modeLabelFor(mode){
+    if (mode === 'raw') return 'Bytebeat (raw 0-255)';
+    if (mode === 'letters') return 'Letters & digits only';
+    if (mode === 'symbols') return 'Letters, digits & symbols (readable)';
+    return mode;
   }
 
   function renderOutputs(){
@@ -388,7 +429,7 @@
       countFull.textContent = '0 characters / 0 samples';
       return;
     }
-    const str = currentMode === 'raw' ? toRawSafeString(bytes) : toLettersDigitsString(bytes);
+    const str = encodeForMode(bytes, currentMode);
 
     if (str.length !== bytes.length){
       // Should never happen; guard explicitly per spec.
@@ -397,7 +438,7 @@
     }
 
     const len = str.length;
-    const modeLabel = currentMode === 'raw' ? 'Bytebeat (raw 0-255)' : 'Letters & digits only';
+    const modeLabel = modeLabelFor(currentMode);
 
     formulaOutput.value = "'" + str + "'.charCodeAt(t % " + len + ")";
     fullOutput.value =
@@ -446,9 +487,24 @@
   }
 
   // ---------- preview playback ----------
+  function stopPreview(){
+    if (previewSource){
+      try { previewSource.onended = null; previewSource.stop(); } catch(e){}
+      previewSource = null;
+    }
+    if (previewCtx){
+      try { previewCtx.close(); } catch(e){}
+      previewCtx = null;
+    }
+    stopBtn.disabled = true;
+  }
+
   function playPreview(){
     const bytes = window.__rawBytes;
     if (!bytes || !bytes.length){ setStatus('Convert a file first.'); return; }
+
+    stopPreview(); // ensure only one preview plays at a time
+
     const rate = window.__sampleRate;
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     let buffer;
@@ -461,15 +517,30 @@
         setStatus('Note: this browser cannot preview at exactly ' + rate + ' Hz; using ' + clamped + ' Hz for preview only (download is unaffected).');
       } catch (e2){
         setStatus('This browser cannot preview at this sample rate. The WAV/string output is unaffected.');
+        try { ctx.close(); } catch(e3){}
         return;
       }
     }
     const chData = buffer.getChannelData(0);
     for (let i = 0; i < bytes.length; i++) chData[i] = (bytes[i] - 128) / 128;
+
     const src = ctx.createBufferSource();
     src.buffer = buffer;
     src.connect(ctx.destination);
-    src.onended = () => setStatus('Preview finished.');
+    src.onended = () => {
+      setStatus('Preview finished.');
+      stopBtn.disabled = true;
+      previewSource = null;
+      if (previewCtx === ctx){
+        try { ctx.close(); } catch(e){}
+        previewCtx = null;
+      }
+    };
+
+    previewCtx = ctx;
+    previewSource = src;
+    stopBtn.disabled = false;
+
     src.start();
     setStatus('Playing preview...');
   }
@@ -478,6 +549,7 @@
   async function convert(){
     const file = fileInput.files[0];
     if (!file){ setStatus('Please choose a file.'); return; }
+    stopPreview();
     convertBtn.disabled = true;
     try {
       setStatus('Reading file...');
@@ -588,6 +660,7 @@
   // ---------- wire up ----------
   convertBtn.addEventListener('click', convert);
   playBtn.addEventListener('click', playPreview);
+  stopBtn.addEventListener('click', stopPreview);
   downloadWavBtn.addEventListener('click', downloadWav);
   copyFormulaBtn.addEventListener('click', () => copyText(formulaOutput));
   copyFullBtn.addEventListener('click', () => copyText(fullOutput));
