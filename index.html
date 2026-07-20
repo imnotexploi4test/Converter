@@ -99,6 +99,17 @@
     resize: vertical;
   }
   .count { font-size: 0.85em; color: #9aa0aa; margin-bottom: 6px; }
+  .composition {
+    font-size: 0.82em;
+    color: #9adfa0;
+    margin-bottom: 8px;
+    background: #0e0f11;
+    border: 1px solid #2c2d31;
+    border-radius: 5px;
+    padding: 8px 10px;
+    display: none;
+  }
+  .composition.visible { display: block; }
   #status {
     padding: 10px 12px;
     background: #1b1c1f;
@@ -111,6 +122,7 @@
   }
   .btnrow { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
   .note { font-size: 0.8em; color: #888; margin-top: 4px; }
+  code { color: #cfe0ff; }
 </style>
 </head>
 <body>
@@ -122,7 +134,7 @@
 
   <div class="row">
     <label for="fileInput">Audio/Video file</label>
-    <input type="file" id="fileInput">
+    <input type="file" id="fileInput" accept="audio/*,video/*">
   </div>
 
   <div class="row">
@@ -135,13 +147,20 @@
     <label>String mode</label>
     <div class="seg" id="modeSeg">
       <button type="button" data-mode="raw" class="active">Bytebeat (raw 0–255)</button>
-      <button type="button" data-mode="letters">Letters &amp; digits only</button>
-      <button type="button" data-mode="symbols">Letters, digits &amp; symbols</button>
+      <button type="button" data-mode="letters">Letters, digits &amp; symbols</button>
     </div>
   </div>
   <div class="row">
-    <span class="note">"Symbols" mode adds readable punctuation (/ ~ &lt; &gt; ! @ # $ % ^ &amp; * ( ) - + = etc.) for much finer resolution than letters-only, while still keeping 1 character = 1 sample. It excludes only <code>'</code> and <code>\</code>, since those cannot appear unescaped in a single-quoted JS string without changing the character count.</span>
+    <span class="note">
+      "Letters, digits &amp; symbols" mode uses a 92-character set: digits, upper/lowercase letters, and
+      <b>every standard printable symbol</b> — <code>! " # $ % &amp; ( ) * + , - . / : ; &lt; = &gt; ? @ [ ] ^ _ ` {'{'} | {'}'} ~</code> —
+      evenly interleaved so symbols appear at a steady rate across the whole sample range, not just at the extremes.
+      Only <code>'</code> and <code>\</code> are excluded — both are structurally impossible to place unescaped inside a
+      single-quoted JS string literal without adding an extra character, which would silently break the
+      "1 character = 1 sample" guarantee once the string is parsed/eval'd (e.g. <code>'\C'</code> parses to 1 character, not 2).
+    </span>
   </div>
+  <div class="composition" id="compositionBox"></div>
 
   <div class="row">
     <label><input type="checkbox" id="advancedCheckbox"> Enable advanced options</label>
@@ -211,8 +230,9 @@
   const countFull = document.getElementById('countFull');
   const copyFormulaBtn = document.getElementById('copyFormulaBtn');
   const copyFullBtn = document.getElementById('copyFullBtn');
+  const compositionBox = document.getElementById('compositionBox');
 
-  let currentMode = 'raw';
+  let currentMode = 'raw'; // 'raw' | 'letters'
   let previewCtx = null;
   let previewSource = null;
 
@@ -248,7 +268,7 @@
       modeSeg.querySelectorAll('button').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       currentMode = btn.dataset.mode;
-      renderOutputs();
+      renderOutputs(); // re-render immediately from the last converted bytes, no reconversion needed
     });
   });
 
@@ -368,6 +388,10 @@
   }
 
   // ---------- string encoding ----------
+
+  // Mode 1: raw bytes mapped straight to char codes 0-255, with only the
+  // 4 characters that would break a single-quoted single-line JS string
+  // literal remapped to a nearby safe code.
   const UNSAFE_MAP = { 39: 38, 92: 91, 10: 9, 13: 12 }; // ' \ LF CR -> nearby safe codes
   function toRawSafeString(bytes){
     const arr = new Array(bytes.length);
@@ -379,20 +403,48 @@
     return arr.join('');
   }
 
-  const CHARSET62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+  // Mode 2: quantize each byte to one level of a 92-character safe,
+  // readable charset (digits + upper + lower + symbols), EVENLY
+  // INTERLEAVED so that symbols appear at a consistent rate across the
+  // entire byte range — not clustered only at the extremes. This matters
+  // because most real audio hovers near the middle byte value (~128,
+  // silence), so a naive ASCII-ordered charset would rarely show a symbol.
+  //
+  // ' and \ are excluded: they cannot appear unescaped inside a
+  // single-quoted JS string literal without adding an extra escape
+  // character, which would break the strict "1 character = 1 sample"
+  // length guarantee once the string is parsed/eval'd.
+  const SYMBOL_CHARS = ['!','"','#','$','%','&','(',')','*','+',',','-','.','/',
+                         ':',';','<','=','>','?','@','[',']','^','_','`','{','|','}','~'];
+  const DIGIT_CHARS  = '0123456789'.split('');
+  const UPPER_CHARS  = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+  const LOWER_CHARS  = 'abcdefghijklmnopqrstuvwxyz'.split('');
+  const SYMBOL_SET = new Set(SYMBOL_CHARS);
 
-  // Readable symbol charset: all printable ASCII 33-126 except ' (39) and \ (92).
-  // Space (32) is excluded too, since leading/trailing/embedded spaces are prone
-  // to being trimmed or collapsed by some tools, which would silently corrupt data.
-  function buildSafeSymbolCharset(){
-    let chars = [];
-    for (let code = 33; code <= 126; code++){
-      if (code === 39 || code === 92) continue; // ' and \
-      chars.push(String.fromCharCode(code));
+  function fairInterleave(groups){
+    const total = groups.reduce((s, g) => s + g.length, 0);
+    const state = groups.map(g => ({
+      items: g,
+      idx: 0,
+      step: total / g.length,
+      nextDue: (total / g.length) / 2 // stagger starting offsets
+    }));
+    const result = new Array(total);
+    for (let i = 0; i < total; i++){
+      let best = -1;
+      for (let gi = 0; gi < state.length; gi++){
+        const s = state[gi];
+        if (s.idx < s.items.length && (best === -1 || s.nextDue < state[best].nextDue)) best = gi;
+      }
+      const s = state[best];
+      result[i] = s.items[s.idx];
+      s.idx++;
+      s.nextDue += s.step;
     }
-    return chars.join('');
+    return result.join('');
   }
-  const CHARSET_SYMBOLS = buildSafeSymbolCharset();
+
+  const CHARSET_LETTERS_SYMBOLS = fairInterleave([SYMBOL_CHARS, DIGIT_CHARS, UPPER_CHARS, LOWER_CHARS]);
 
   function toQuantizedString(bytes, charset){
     const n = charset.length;
@@ -406,19 +458,34 @@
     return arr.join('');
   }
 
+  // Single, unambiguous dispatch point used everywhere a string is generated.
   function encodeForMode(bytes, mode){
-    if (mode === 'raw') return toRawSafeString(bytes);
-    if (mode === 'letters') return toQuantizedString(bytes, CHARSET62);
-    if (mode === 'symbols') return toQuantizedString(bytes, CHARSET_SYMBOLS);
-    return toRawSafeString(bytes);
+    if (mode === 'letters') return toQuantizedString(bytes, CHARSET_LETTERS_SYMBOLS);
+    return toRawSafeString(bytes); // default / 'raw'
   }
 
   function modeLabelFor(mode){
-    if (mode === 'raw') return 'Bytebeat (raw 0-255)';
-    if (mode === 'letters') return 'Letters & digits only';
-    if (mode === 'symbols') return 'Letters, digits & symbols (readable)';
-    return mode;
+    if (mode === 'letters') return 'Letters, digits & symbols (' + CHARSET_LETTERS_SYMBOLS.length + '-char safe set, evenly interleaved)';
+    return 'Bytebeat (raw 0-255)';
   }
+
+  // Measures the ACTUAL composition of a generated string, so it can be
+  // displayed as concrete proof that symbols really are present, not
+  // just theoretically included in the charset.
+  function computeComposition(str){
+    let symbols = 0, digits = 0, upper = 0, lower = 0, other = 0;
+    for (let i = 0; i < str.length; i++){
+      const c = str[i];
+      if (c >= '0' && c <= '9') digits++;
+      else if (c >= 'A' && c <= 'Z') upper++;
+      else if (c >= 'a' && c <= 'z') lower++;
+      else if (SYMBOL_SET.has(c)) symbols++;
+      else other++;
+    }
+    return { symbols, digits, upper, lower, other, total: str.length };
+  }
+
+  function pct(n, total){ return total ? ((n / total) * 100).toFixed(1) : '0.0'; }
 
   function renderOutputs(){
     const bytes = window.__rawBytes;
@@ -427,13 +494,14 @@
       fullOutput.value = '';
       countFormula.textContent = '0 characters / 0 samples';
       countFull.textContent = '0 characters / 0 samples';
+      compositionBox.classList.remove('visible');
       return;
     }
     const str = encodeForMode(bytes, currentMode);
 
     if (str.length !== bytes.length){
       // Should never happen; guard explicitly per spec.
-      setStatus('Internal error: string length does not match sample count!');
+      setStatus('Internal error: string length (' + str.length + ') does not match sample count (' + bytes.length + ')!');
       return;
     }
 
@@ -449,6 +517,20 @@
 
     countFormula.textContent = len + ' characters / ' + bytes.length + ' samples';
     countFull.textContent = len + ' characters / ' + bytes.length + ' samples';
+
+    if (currentMode === 'letters'){
+      const comp = computeComposition(str);
+      compositionBox.innerHTML =
+        '<b>Actual measured composition of this ' + comp.total + '-character string:</b><br>' +
+        'Symbols: ' + comp.symbols + ' (' + pct(comp.symbols, comp.total) + '%) &nbsp;|&nbsp; ' +
+        'Digits: ' + comp.digits + ' (' + pct(comp.digits, comp.total) + '%) &nbsp;|&nbsp; ' +
+        'Uppercase: ' + comp.upper + ' (' + pct(comp.upper, comp.total) + '%) &nbsp;|&nbsp; ' +
+        'Lowercase: ' + comp.lower + ' (' + pct(comp.lower, comp.total) + '%)' +
+        (comp.other ? ' &nbsp;|&nbsp; Other: ' + comp.other : '');
+      compositionBox.classList.add('visible');
+    } else {
+      compositionBox.classList.remove('visible');
+    }
   }
 
   // ---------- WAV export ----------
