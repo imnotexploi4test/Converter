@@ -134,7 +134,7 @@
 
   <div class="row">
     <label for="fileInput">Audio/Video file</label>
-    <input type="file" id="fileInput">
+    <input type="file" id="fileInput" accept="audio/*,video/*">
   </div>
 
   <div class="row">
@@ -152,14 +152,14 @@
   </div>
   <div class="row">
     <span class="note">
-      "Letters, digits &amp; symbols" mode uses a 92-character set (digits, upper/lowercase letters, and
-      the symbols <code>! " # $ % &amp; ( ) * + , - . / : ; &lt; = &gt; ? @ [ ] ^ _ ` { | } ~</code>).
-      Symbols are deliberately placed at the levels closest to silence (byte value ~128) — the range almost
-      all real audio actually spends most of its time in — so they reliably show up throughout the output,
-      not just in rare loud peaks. Only <code>'</code> and <code>\</code> are excluded, since both would
-      require an extra escape character inside a single-quoted JS string literal, which would silently
-      change the parsed string's length (e.g. <code>'\C'</code> parses to 1 character, not 2) and break the
-      strict "1 character = 1 sample" guarantee.
+      "Letters, digits &amp; symbols" mode maps each byte to a contiguous ASCII run from <code>'0'</code> (code 48)
+      through <code>'z'</code> (code 122) — 75 characters total: digits, then symbols <code>: ; &lt; = &gt; ? @</code>,
+      then uppercase letters, then symbols <code>[ ] ^ _ ` ~</code>, then lowercase letters. This is the same
+      linear mapping idea as <code>chr(int((value+1)*37+48))</code>, adapted for 0–255 byte input. The second
+      symbol band sits near the middle of the range, so symbols appear reliably even in quiet/silent audio.
+      Only <code>\\</code> (backslash) is remapped — to <code>~</code> — since a raw backslash inside a
+      single-quoted JS string starts an escape sequence and would silently change the parsed string's length,
+      breaking the "1 character = 1 sample" guarantee.
     </span>
   </div>
   <div class="composition" id="compositionBox"></div>
@@ -405,78 +405,44 @@
     return arr.join('');
   }
 
-  // Mode 2: quantize each byte to one of a 92-character safe, readable
-  // charset (digits + upper + lower + symbols).
+  // Mode 2: "Letters, digits & symbols" — ported from a reference
+  // implementation's mapping idea: chr(int((value + 1) * 37 + 48)),
+  // which for a float sample in roughly [-1, 1] produces a contiguous
+  // ASCII run from code 48 ('0') to code 122 ('z'). We adapt this for
+  // our 0-255 byte pipeline as: code = 48 + floor(byte * 75 / 256).
   //
-  // KEY DESIGN POINT: symbols are deliberately assigned to the
-  // quantization levels CLOSEST TO THE CENTER (byte value ~128, i.e.
-  // silence/near-silence) rather than spread "evenly" across the full
-  // 0-255 range. Real-world audio spends the overwhelming majority of
-  // its time at or near silence, so a naive even spread meant a
-  // near-silent passage would almost always land on the exact same
-  // single non-symbol character for its entire duration. By placing all
-  // 30 symbols at the levels nearest to center, symbols reliably appear
-  // throughout typical audio, not just during rare loud peaks.
+  // This contiguous range naturally contains TWO symbol bands in
+  // standard ASCII order:
+  //   codes 58-64: : ; < = > ? @      (between digits and uppercase)
+  //   codes 91-96: [ \ ] ^ _ `        (between uppercase and lowercase)
+  // The second band lands near the middle of the 75-level range, i.e.
+  // close to byte value ~160 — near where quiet/near-silent audio
+  // (byte ~128) actually falls — so symbols show up reliably in normal
+  // audio, not just at rare extremes.
   //
-  // ' and \ are excluded entirely: they cannot appear unescaped inside a
-  // single-quoted JS string literal without an extra escape character,
-  // which would break the strict "1 character = 1 sample" guarantee.
-  const SYMBOL_CHARS = ['!','"','#','$','%','&','(',')','*','+',',','-','.','/',
-                         ':',';','<','=','>','?','@','[',']','^','_','`','{','|','}','~'];
-  const DIGIT_CHARS  = '0123456789'.split('');
-  const UPPER_CHARS  = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
-  const LOWER_CHARS  = 'abcdefghijklmnopqrstuvwxyz'.split('');
-  const SYMBOL_SET = new Set(SYMBOL_CHARS);
-
-  // Fairly interleaves multiple character groups (round-robin by
-  // proportion) — used only for ordering the non-symbol characters here.
-  function fairInterleave(groups){
-    const total = groups.reduce((s, g) => s + g.length, 0);
-    const state = groups.map(g => ({
-      items: g,
-      idx: 0,
-      step: total / g.length,
-      nextDue: (total / g.length) / 2
-    }));
-    const result = new Array(total);
-    for (let i = 0; i < total; i++){
-      let best = -1;
-      for (let gi = 0; gi < state.length; gi++){
-        const s = state[gi];
-        if (s.idx < s.items.length && (best === -1 || s.nextDue < state[best].nextDue)) best = gi;
-      }
-      const s = state[best];
-      result[i] = s.items[s.idx];
-      s.idx++;
-      s.nextDue += s.step;
+  // The reference implementation attempted to escape a literal
+  // backslash (code 92, which falls inside this range) by calling
+  // .replace() on each single character — that can never match a
+  // 2-character pattern, so it never actually worked, and would have
+  // let raw backslashes leak into a double-quoted JS string (silently
+  // corrupting length once parsed). Since escaping adds a character
+  // and breaks our strict 1-char-per-sample rule anyway, we instead
+  // REMAP backslash to '~' (a safe symbol not otherwise in this range),
+  // keeping the set at exactly 75 safe, readable characters.
+  function buildLettersDigitsSymbolsCharset(){
+    const chars = [];
+    for (let code = 48; code <= 122; code++){
+      chars.push(String.fromCharCode(code));
     }
-    return result.join('');
+    const backslashIndex = chars.indexOf('\\');
+    if (backslashIndex !== -1) chars[backslashIndex] = '~';
+    return chars.join('');
   }
+  const CHARSET_LETTERS_SYMBOLS = buildLettersDigitsSymbolsCharset();
 
-  function buildCenterWeightedCharset(){
-    const outerChars = fairInterleave([DIGIT_CHARS, UPPER_CHARS, LOWER_CHARS]).split(''); // 62 chars
-    const n = SYMBOL_CHARS.length + outerChars.length; // 92
-
-    // Rank every level index (0..n-1) by how close it is to the exact
-    // center — the byte value quantization bucket that near-silent audio
-    // (byte ~128) falls into.
-    const centerPoint = (n - 1) / 2;
-    const levelOrder = Array.from({ length: n }, (_, i) => i)
-      .sort((a, b) => Math.abs(a - centerPoint) - Math.abs(b - centerPoint));
-
-    const charsetArr = new Array(n);
-    // The 30 levels closest to center get symbols.
-    for (let k = 0; k < SYMBOL_CHARS.length; k++){
-      charsetArr[levelOrder[k]] = SYMBOL_CHARS[k];
-    }
-    // The remaining, more extreme (louder) levels get digits/letters.
-    for (let k = 0; k < outerChars.length; k++){
-      charsetArr[levelOrder[SYMBOL_CHARS.length + k]] = outerChars[k];
-    }
-    return charsetArr.join('');
-  }
-
-  const CHARSET_LETTERS_SYMBOLS = buildCenterWeightedCharset();
+  // Actual symbol characters present in the charset above (for the
+  // composition readout only).
+  const SYMBOL_SET = new Set([':',';','<','=','>','?','@','[',']','^','_','`','~']);
 
   function toQuantizedString(bytes, charset){
     const n = charset.length;
@@ -497,7 +463,7 @@
   }
 
   function modeLabelFor(mode){
-    if (mode === 'letters') return 'Letters, digits & symbols (' + CHARSET_LETTERS_SYMBOLS.length + '-char safe set, symbol-weighted near silence)';
+    if (mode === 'letters') return 'Letters, digits & symbols (' + CHARSET_LETTERS_SYMBOLS.length + '-char ASCII 48-122 run, \\ remapped to ~)';
     return 'Bytebeat (raw 0-255)';
   }
 
