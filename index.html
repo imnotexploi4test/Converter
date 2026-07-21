@@ -152,12 +152,14 @@
   </div>
   <div class="row">
     <span class="note">
-      "Letters, digits &amp; symbols" mode uses a 92-character set: digits, upper/lowercase letters, and
-      <b>every standard printable symbol</b> — <code>! " # $ % &amp; ( ) * + , - . / : ; &lt; = &gt; ? @ [ ] ^ _ ` {'{'} | {'}'} ~</code> —
-      evenly interleaved so symbols appear at a steady rate across the whole sample range, not just at the extremes.
-      Only <code>'</code> and <code>\</code> are excluded — both are structurally impossible to place unescaped inside a
-      single-quoted JS string literal without adding an extra character, which would silently break the
-      "1 character = 1 sample" guarantee once the string is parsed/eval'd (e.g. <code>'\C'</code> parses to 1 character, not 2).
+      "Letters, digits &amp; symbols" mode uses a 92-character set (digits, upper/lowercase letters, and
+      the symbols <code>! " # $ % &amp; ( ) * + , - . / : ; &lt; = &gt; ? @ [ ] ^ _ ` { | } ~</code>).
+      Symbols are deliberately placed at the levels closest to silence (byte value ~128) — the range almost
+      all real audio actually spends most of its time in — so they reliably show up throughout the output,
+      not just in rare loud peaks. Only <code>'</code> and <code>\</code> are excluded, since both would
+      require an extra escape character inside a single-quoted JS string literal, which would silently
+      change the parsed string's length (e.g. <code>'\C'</code> parses to 1 character, not 2) and break the
+      strict "1 character = 1 sample" guarantee.
     </span>
   </div>
   <div class="composition" id="compositionBox"></div>
@@ -403,17 +405,22 @@
     return arr.join('');
   }
 
-  // Mode 2: quantize each byte to one level of a 92-character safe,
-  // readable charset (digits + upper + lower + symbols), EVENLY
-  // INTERLEAVED so that symbols appear at a consistent rate across the
-  // entire byte range — not clustered only at the extremes. This matters
-  // because most real audio hovers near the middle byte value (~128,
-  // silence), so a naive ASCII-ordered charset would rarely show a symbol.
+  // Mode 2: quantize each byte to one of a 92-character safe, readable
+  // charset (digits + upper + lower + symbols).
   //
-  // ' and \ are excluded: they cannot appear unescaped inside a
-  // single-quoted JS string literal without adding an extra escape
-  // character, which would break the strict "1 character = 1 sample"
-  // length guarantee once the string is parsed/eval'd.
+  // KEY DESIGN POINT: symbols are deliberately assigned to the
+  // quantization levels CLOSEST TO THE CENTER (byte value ~128, i.e.
+  // silence/near-silence) rather than spread "evenly" across the full
+  // 0-255 range. Real-world audio spends the overwhelming majority of
+  // its time at or near silence, so a naive even spread meant a
+  // near-silent passage would almost always land on the exact same
+  // single non-symbol character for its entire duration. By placing all
+  // 30 symbols at the levels nearest to center, symbols reliably appear
+  // throughout typical audio, not just during rare loud peaks.
+  //
+  // ' and \ are excluded entirely: they cannot appear unescaped inside a
+  // single-quoted JS string literal without an extra escape character,
+  // which would break the strict "1 character = 1 sample" guarantee.
   const SYMBOL_CHARS = ['!','"','#','$','%','&','(',')','*','+',',','-','.','/',
                          ':',';','<','=','>','?','@','[',']','^','_','`','{','|','}','~'];
   const DIGIT_CHARS  = '0123456789'.split('');
@@ -421,13 +428,15 @@
   const LOWER_CHARS  = 'abcdefghijklmnopqrstuvwxyz'.split('');
   const SYMBOL_SET = new Set(SYMBOL_CHARS);
 
+  // Fairly interleaves multiple character groups (round-robin by
+  // proportion) — used only for ordering the non-symbol characters here.
   function fairInterleave(groups){
     const total = groups.reduce((s, g) => s + g.length, 0);
     const state = groups.map(g => ({
       items: g,
       idx: 0,
       step: total / g.length,
-      nextDue: (total / g.length) / 2 // stagger starting offsets
+      nextDue: (total / g.length) / 2
     }));
     const result = new Array(total);
     for (let i = 0; i < total; i++){
@@ -444,7 +453,30 @@
     return result.join('');
   }
 
-  const CHARSET_LETTERS_SYMBOLS = fairInterleave([SYMBOL_CHARS, DIGIT_CHARS, UPPER_CHARS, LOWER_CHARS]);
+  function buildCenterWeightedCharset(){
+    const outerChars = fairInterleave([DIGIT_CHARS, UPPER_CHARS, LOWER_CHARS]).split(''); // 62 chars
+    const n = SYMBOL_CHARS.length + outerChars.length; // 92
+
+    // Rank every level index (0..n-1) by how close it is to the exact
+    // center — the byte value quantization bucket that near-silent audio
+    // (byte ~128) falls into.
+    const centerPoint = (n - 1) / 2;
+    const levelOrder = Array.from({ length: n }, (_, i) => i)
+      .sort((a, b) => Math.abs(a - centerPoint) - Math.abs(b - centerPoint));
+
+    const charsetArr = new Array(n);
+    // The 30 levels closest to center get symbols.
+    for (let k = 0; k < SYMBOL_CHARS.length; k++){
+      charsetArr[levelOrder[k]] = SYMBOL_CHARS[k];
+    }
+    // The remaining, more extreme (louder) levels get digits/letters.
+    for (let k = 0; k < outerChars.length; k++){
+      charsetArr[levelOrder[SYMBOL_CHARS.length + k]] = outerChars[k];
+    }
+    return charsetArr.join('');
+  }
+
+  const CHARSET_LETTERS_SYMBOLS = buildCenterWeightedCharset();
 
   function toQuantizedString(bytes, charset){
     const n = charset.length;
@@ -465,13 +497,12 @@
   }
 
   function modeLabelFor(mode){
-    if (mode === 'letters') return 'Letters, digits & symbols (' + CHARSET_LETTERS_SYMBOLS.length + '-char safe set, evenly interleaved)';
+    if (mode === 'letters') return 'Letters, digits & symbols (' + CHARSET_LETTERS_SYMBOLS.length + '-char safe set, symbol-weighted near silence)';
     return 'Bytebeat (raw 0-255)';
   }
 
   // Measures the ACTUAL composition of a generated string, so it can be
-  // displayed as concrete proof that symbols really are present, not
-  // just theoretically included in the charset.
+  // displayed as concrete proof that symbols really are present.
   function computeComposition(str){
     let symbols = 0, digits = 0, upper = 0, lower = 0, other = 0;
     for (let i = 0; i < str.length; i++){
@@ -500,7 +531,6 @@
     const str = encodeForMode(bytes, currentMode);
 
     if (str.length !== bytes.length){
-      // Should never happen; guard explicitly per spec.
       setStatus('Internal error: string length (' + str.length + ') does not match sample count (' + bytes.length + ')!');
       return;
     }
@@ -585,7 +615,7 @@
     const bytes = window.__rawBytes;
     if (!bytes || !bytes.length){ setStatus('Convert a file first.'); return; }
 
-    stopPreview(); // ensure only one preview plays at a time
+    stopPreview();
 
     const rate = window.__sampleRate;
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -652,8 +682,6 @@
       let monoData = downmixToMono(audioBuffer);
       let procRate = audioBuffer.sampleRate;
 
-      // OfflineAudioContext requires a sample rate within a valid range;
-      // if the source is unusually low, bump it up before effects processing.
       if (procRate < 8000){
         monoData = resampleLinear(monoData, procRate, 8000);
         procRate = 8000;
