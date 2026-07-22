@@ -161,13 +161,10 @@
   <div class="row">
     <span class="note">
       "Letters, digits &amp; symbols" mode uses a 75-character set (digits, symbols
-      <code>: ; &lt; = &gt; ? @</code>, uppercase, symbols <code>[ ] ^ _ ` ~</code>, lowercase). Because this is
-      far fewer than 256 levels, it now outputs a <b>FloatBeat</b>-style formula — a continuous float in
-      <code>[-1, 1]</code> — instead of a bytebeat integer. Standard integer-bytebeat formulas
-      (<code>charCodeAt(...) * 3 - 127</code>) assume a full 256-level unsigned byte wrapping via <code>&amp; 255</code>;
-      applied to only 75 uneven levels, that produces harsh, jarring jumps ("seizure"-like audio). FloatBeat's
-      linear normalization avoids that by scaling proportionally to the actual character codes used, regardless
-      of how many discrete levels there are. Raw mode is unaffected — it already has full 256-level resolution.
+      <code>: ; &lt; = &gt; ? @</code>, uppercase, symbols <code>[ ] ^ _ ` ~</code>, lowercase), and produces a
+      float-style formula: <code>((d[t % d.length].charCodeAt(0) * 3) - 127) / 128 - 1</code>. Only
+      <code>\</code> is remapped — to <code>~</code> — since a raw backslash cannot appear unescaped in a
+      single-quoted string without changing the character count.
     </span>
   </div>
   <div class="composition" id="compositionBox"></div>
@@ -218,7 +215,6 @@
 (function(){
   'use strict';
 
-  // ---------- DOM refs ----------
   const fileInput = document.getElementById('fileInput');
   const sampleRateSlider = document.getElementById('sampleRateSlider');
   const sampleRateNumber = document.getElementById('sampleRateNumber');
@@ -242,13 +238,12 @@
   const copyFullBtn = document.getElementById('copyFullBtn');
   const compositionBox = document.getElementById('compositionBox');
 
-  let currentMode = 'raw'; // 'raw' | 'letters'
+  let currentMode = 'raw';
   let previewCtx = null;
   let previewSource = null;
 
   function setStatus(msg){ statusEl.textContent = msg; }
 
-  // ---------- blocked text/code file extensions ----------
   const BLOCKED_TEXT_EXTENSIONS = new Set([
     'txt','html','htm','css','scss','less','js','jsx','mjs','cjs','tsx',
     'py','lua','java','c','cpp','h','hpp','cs','rb','go','rs','php','sql',
@@ -271,7 +266,6 @@
     }
   });
 
-  // ---------- sample rate slider/number sync ----------
   function clampRate(v){
     v = Math.round(v);
     if (isNaN(v)) v = 22500;
@@ -295,7 +289,6 @@
   });
   function getSampleRate(){ return clampRate(parseInt(sampleRateNumber.value, 10)); }
 
-  // ---------- mode segmented buttons ----------
   modeSeg.querySelectorAll('button').forEach(btn => {
     btn.addEventListener('click', () => {
       modeSeg.querySelectorAll('button').forEach(b => b.classList.remove('active'));
@@ -305,7 +298,6 @@
     });
   });
 
-  // ---------- advanced options gating ----------
   advancedCheckbox.addEventListener('change', () => {
     const show = advancedCheckbox.checked;
     volumeRow.classList.toggle('hidden', !show);
@@ -315,7 +307,6 @@
     bassDbInput.disabled = !bassCheckbox.checked;
   });
 
-  // ---------- helpers ----------
   function downmixToMono(buffer){
     const channels = buffer.numberOfChannels;
     const length = buffer.length;
@@ -380,7 +371,6 @@
     });
   }
 
-  // ---------- ffmpeg.wasm fallback (lazy-loaded) ----------
   let ffmpegInstance = null;
   function loadScript(src){
     return new Promise((resolve, reject) => {
@@ -419,11 +409,6 @@
     return await decodeAudioDataAsync(ctx, wavBuffer);
   }
 
-  // ---------- string encoding ----------
-
-  // Mode 1: raw bytes mapped straight to char codes 0-255, with only the
-  // 4 characters that would break a single-quoted single-line JS string
-  // literal remapped to a nearby safe code.
   const UNSAFE_MAP = { 39: 38, 92: 91, 10: 9, 13: 12 };
   function toRawSafeString(bytes){
     const arr = new Array(bytes.length);
@@ -435,10 +420,6 @@
     return arr.join('');
   }
 
-  // Mode 2: "Letters, digits & symbols" — contiguous ASCII run from code
-  // 48 ('0') to 122 ('z'), 75 characters. Backslash (code 92) is
-  // remapped to '~' (code 126) since it can't appear unescaped inside a
-  // single-quoted JS string without adding a character.
   function buildLettersDigitsSymbolsCharset(){
     const chars = [];
     for (let code = 48; code <= 122; code++){
@@ -450,15 +431,6 @@
   }
   const CHARSET_LETTERS_SYMBOLS = buildLettersDigitsSymbolsCharset();
   const SYMBOL_SET = new Set([':',';','<','=','>','?','@','[',']','^','_','`','~']);
-
-  // Precompute the actual min/max character codes present in the
-  // charset (accounting for the '~' remap, which is OUTSIDE the 48-122
-  // run) so the FloatBeat normalization below is always exactly correct.
-  const CHARSET_CODES = CHARSET_LETTERS_SYMBOLS.split('').map(c => c.charCodeAt(0));
-  const CHARSET_MIN_CODE = Math.min.apply(null, CHARSET_CODES);
-  const CHARSET_MAX_CODE = Math.max.apply(null, CHARSET_CODES);
-  const CHARSET_MID = (CHARSET_MIN_CODE + CHARSET_MAX_CODE) / 2;
-  const CHARSET_HALF_RANGE = (CHARSET_MAX_CODE - CHARSET_MIN_CODE) / 2;
 
   function toQuantizedString(bytes, charset){
     const n = charset.length;
@@ -478,7 +450,7 @@
   }
 
   function modeLabelFor(mode){
-    if (mode === 'letters') return 'Letters, digits & symbols (75-char set, FloatBeat formula)';
+    if (mode === 'letters') return 'Letters, digits & symbols (75-char set)';
     return 'Bytebeat (raw 0-255)';
   }
 
@@ -518,19 +490,13 @@
     const modeLabel = modeLabelFor(currentMode);
 
     if (currentMode === 'letters'){
-      // FloatBeat formula: normalizes the character code to a continuous
-      // float in [-1, 1] based on the ACTUAL min/max codes present in
-      // this charset (accounts for the '~' remap). This avoids the
-      // harsh, uneven jumps that a "* 3 - 127" integer-bytebeat mapping
-      // produces when there are far fewer than 256 discrete levels.
       formulaOutput.value =
-        "d='" + str + "',(d.charCodeAt(t%d.length)-" + CHARSET_MID + ")/" + CHARSET_HALF_RANGE;
+        "d='" + str + "',((d[t%d.length].charCodeAt(0)*3)-127)/128-1";
       fullOutput.value =
         "a = '" + str + "';\n" +
         "// sample rate: " + window.__sampleRate + " Hz\n" +
         "// mode: " + modeLabel + "\n" +
-        "// FloatBeat: t => (a.charCodeAt(t % a.length) - " + CHARSET_MID + ") / " + CHARSET_HALF_RANGE + "\n" +
-        "// (returns a float in [-1, 1] — use with a FloatBeat-capable player, not raw integer bytebeat)";
+        "// t => ((a[t % a.length].charCodeAt(0) * 3) - 127) / 128 - 1";
     } else {
       formulaOutput.value = "'" + str + "'.charCodeAt(t % " + len + ")";
       fullOutput.value =
@@ -558,7 +524,6 @@
     }
   }
 
-  // ---------- WAV export ----------
   function writeAsciiString(view, offset, str){
     for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
   }
@@ -593,7 +558,6 @@
     setTimeout(() => URL.revokeObjectURL(url), 2000);
   }
 
-  // ---------- preview playback ----------
   function stopPreview(){
     if (previewSource){
       try { previewSource.onended = null; previewSource.stop(); } catch(e){}
@@ -652,7 +616,6 @@
     setStatus('Playing preview...');
   }
 
-  // ---------- main conversion pipeline ----------
   async function convert(){
     const file = fileInput.files[0];
     if (!file){ setStatus('Please choose a file.'); return; }
@@ -754,7 +717,6 @@
     }
   }
 
-  // ---------- copy buttons ----------
   async function copyText(el){
     try {
       await navigator.clipboard.writeText(el.value);
@@ -766,7 +728,6 @@
     }
   }
 
-  // ---------- wire up ----------
   convertBtn.addEventListener('click', convert);
   playBtn.addEventListener('click', playPreview);
   stopBtn.addEventListener('click', stopPreview);
