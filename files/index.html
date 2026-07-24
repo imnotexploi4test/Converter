@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audio → Bytebeat / Floatbeat Converter</title>
+<link rel="stylesheet" href="base.css">
+<link rel="stylesheet" href="components.css">
+<link rel="stylesheet" href="animations.css">
+</head>
+<body>
+
+  <div id="toastContainer" aria-live="polite"></div>
+
+  <h1>Audio → Bytebeat / Floatbeat Converter</h1>
+  <p class="note">Load an audio file, tweak sample rate/volume, then encode it as a bytebeat (raw byte) or floatbeat (printable letters/digits/symbols) formula. Everything runs locally in your browser.</p>
+
+  <!-- Drop zone -->
+  <div class="drop-zone" id="dropZone">
+    <div id="dropSpinner" class="upload-spinner" style="display:none;">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+        <circle cx="14" cy="14" r="11" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-dasharray="52 17"/>
+      </svg>
+    </div>
+    <div class="upload-icon">🎵</div>
+    <div class="drop-title"><strong>Drop an audio file here, or click to choose one</strong></div>
+    <div class="drop-sub note">Decoded locally via the Web Audio API — nothing is uploaded.</div>
+    <input type="file" id="audioFile" accept="audio/*" style="display:none;">
+  </div>
+
+  <p class="rate-display">Current sample rate: <strong><span id="currentRate">44100</span></strong> Hz</p>
+
+  <!-- Sample rate controls -->
+  <section class="panel-block">
+    <h2>Sample rate</h2>
+    <div class="size-controls">
+      <label>Set custom sample rate:
+        <input type="number" id="customSampleRate" min="1" value="44100">
+      </label>
+      <button id="setCustomSampleRateBtn">Apply</button>
+    </div>
+    <div class="size-controls">
+      <label>Divide sample rate by:
+        <input type="number" id="sampleRateDivider" min="1" value="1">
+      </label>
+      <div class="btn-group">
+        <button id="divideSampleRateBtn">Divide</button>
+        <button id="undoDivideSampleRateBtn">Restore original rate</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Volume controls -->
+  <section class="panel-block">
+    <h2>Volume</h2>
+    <div class="size-controls">
+      <label>Volume (%):
+        <input type="number" id="volume" min="0" value="100">
+      </label>
+      <button id="convertToSampleData">1. Convert to Sample Data</button>
+    </div>
+    <div class="size-controls">
+      <label>Divide volume by:
+        <input type="number" id="volumeDividerValue" min="1" value="1">
+      </label>
+      <div class="btn-group">
+        <button id="divideVolumeBtn">Divide</button>
+        <button id="undoDivideVolumeBtn">Restore original volume</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Mode + format -->
+  <section class="panel-block">
+    <h2>Encoding mode</h2>
+    <div class="checkbox-wrapper">
+      <label>
+        <input type="checkbox" id="enableFloat" checked>
+        Floatbeat (printable letters/digits/symbols, decodes to a float ≈ -1..1). Unchecked = classic Bytebeat (raw byte 0-255).
+      </label>
+    </div>
+    <div class="danger-zone">
+      <h3>⚠ Raw byte mode</h3>
+      <p>Bytebeat (raw) mode uses the full 0–255 character range, which includes non-printable control characters. Some text fields, consoles, or file formats may not handle these safely — Floatbeat mode avoids this by only using printable characters.</p>
+      <p class="danger-text" id="dangerText">You've disabled Floatbeat mode — the output string will contain non-printable control characters.</p>
+    </div>
+
+    <div class="format-select">
+      <label><input type="radio" name="format" value="default" checked> Default (<code>sampledata=...</code>)</label>
+      <label><input type="radio" name="format" value="alternate"> Alternate (<code>t||(sampledata=...)</code>, assigns once)</label>
+      <label><input type="radio" name="format" value="assignment"> Assignment (<code>(sample_data=...)</code>)</label>
+    </div>
+  </section>
+
+  <!-- Convert + output -->
+  <section class="panel-block">
+    <h2>Convert</h2>
+    <button id="convertToBytebeat">2. Convert to Bytebeat</button>
+    <span class="output-count" id="outputCount">0 chars / 0 samples</span>
+    <textarea id="output" readonly placeholder="Formula output will appear here…"></textarea>
+    <div class="btn-group">
+      <button id="copyBytebeat">Copy</button>
+      <button id="downloadBytebeat">Download as standalone HTML</button>
+    </div>
+  </section>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
